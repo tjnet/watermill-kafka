@@ -283,6 +283,8 @@ func (s *Subscriber) consumeGroupMessages(
 		messageLogFields: logFields,
 	}
 
+	// TODO: refactor
+	// see https://github.com/DataWorkbench/common/blob/8364bed7bb7c5f9b21f9aae2ef740131b4b7b256/kafka/consumer_handler.go#L51
 	if otelEnabled {
 		handler = otelsarama.WrapConsumerGroupHandler(handler)
 	}
@@ -367,7 +369,7 @@ func (s *Subscriber) consumeWithoutConsumerGroups(
 	topic string,
 	output chan *message.Message,
 	logFields watermill.LogFields,
-	otelEnabled bool,
+	otelEnabled bool, // TODO: update this using
 ) (chan struct{}, error) {
 	consumer, err := sarama.NewConsumerFromClient(client)
 	if err != nil {
@@ -543,6 +545,7 @@ func (h messageHandler) processMessage(
 	ctx = setPartitionToCtx(ctx, kafkaMsg.Partition)
 	ctx = setPartitionOffsetToCtx(ctx, kafkaMsg.Offset)
 	ctx = setMessageTimestampToCtx(ctx, kafkaMsg.Timestamp)
+	ctx = setMessageHeaderToCtx(ctx, kafkaMsg.Headers)
 
 	msg, err := h.unmarshaler.Unmarshal(kafkaMsg)
 	if err != nil {
@@ -597,6 +600,14 @@ ResendLoop:
 		}
 	}
 
+	return nil
+}
+
+// TODO: refactor
+// open a trace span.
+func (s *Subscriber) spanHandler(ctx context.Context, kafkaMsg *sarama.ConsumerMessage, handler *messageHandler,
+	sess sarama.ConsumerGroupSession,
+) (err error) {
 	return nil
 }
 

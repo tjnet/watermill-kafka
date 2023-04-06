@@ -18,7 +18,7 @@ func BenchmarkSubscriber(b *testing.B) {
 		publisher, err := kafka.NewPublisher(kafka.PublisherConfig{
 			Brokers:   kafkaBrokers(),
 			Marshaler: kafka.DefaultMarshaler{},
-		}, logger)
+		}, logger, nil)
 		if err != nil {
 			panic(err)
 		}

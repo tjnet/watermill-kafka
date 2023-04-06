@@ -2,6 +2,8 @@ package kafka
 
 import (
 	"go.opentelemetry.io/contrib/instrumentation/github.com/Shopify/sarama/otelsarama"
+	"go.opentelemetry.io/otel/propagation"
+	oteltrace "go.opentelemetry.io/otel/trace"
 	"time"
 
 	"github.com/Shopify/sarama"
@@ -11,18 +13,21 @@ import (
 	"github.com/ThreeDotsLabs/watermill/message"
 )
 
-type Publisher struct {
-	config   PublisherConfig
-	producer sarama.SyncProducer
-	logger   watermill.LoggerAdapter
+var propagators = propagation.TraceContext{}
 
-	closed bool
+type Publisher struct {
+	config      PublisherConfig
+	producer    sarama.SyncProducer
+	logger      watermill.LoggerAdapter
+	interceptor PublishInterceptor
+	closed      bool
 }
 
 // NewPublisher creates a new Kafka Publisher.
 func NewPublisher(
 	config PublisherConfig,
 	logger watermill.LoggerAdapter,
+	interceptors []PublishInterceptor,
 ) (*Publisher, error) {
 	config.setDefaults()
 
@@ -40,13 +45,19 @@ func NewPublisher(
 	}
 
 	if config.OTELEnabled {
-		producer = otelsarama.WrapSyncProducer(config.OverwriteSaramaConfig, producer)
+		traceProvider := config.OTELTraceProvider
+		opts := []otelsarama.Option{
+			otelsarama.WithTracerProvider(traceProvider),
+			otelsarama.WithPropagators(propagators),
+		}
+		producer = otelsarama.WrapSyncProducer(config.OverwriteSaramaConfig, producer, opts...)
 	}
 
 	return &Publisher{
-		config:   config,
-		producer: producer,
-		logger:   logger,
+		config:      config,
+		producer:    producer,
+		logger:      logger,
+		interceptor: ChainedInterceptor(interceptors...),
 	}, nil
 }
 
@@ -62,6 +73,8 @@ type PublisherConfig struct {
 
 	// If true then each sent message will be wrapped with Opentelemetry tracing, provided by otelsarama.
 	OTELEnabled bool
+
+	OTELTraceProvider oteltrace.TracerProvider
 }
 
 func (c *PublisherConfig) setDefaults() {
@@ -106,23 +119,36 @@ func (p *Publisher) Publish(topic string, msgs ...*message.Message) error {
 	logFields["topic"] = topic
 
 	for _, msg := range msgs {
-		logFields["message_uuid"] = msg.UUID
-		p.logger.Trace("Sending message to Kafka", logFields)
+		if err := p.interceptor(msg, func(message *message.Message) error {
 
-		kafkaMsg, err := p.config.Marshaler.Marshal(topic, msg)
-		if err != nil {
-			return errors.Wrapf(err, "cannot marshal message %s", msg.UUID)
+			logFields["message_uuid"] = msg.UUID
+			p.logger.Trace("Sending message to Kafka", logFields)
+
+			kafkaMsg, err := p.config.Marshaler.Marshal(topic, msg)
+			if err != nil {
+				return errors.Wrapf(err, "cannot marshal message %s", msg.UUID)
+			}
+
+			if p.config.OTELEnabled {
+				// see https://github.com/open-telemetry/opentelemetry-go-contrib/blob/c52452d90ab05a5a92f54398c0093376883cca2a/instrumentation/github.com/Shopify/sarama/otelsarama/test/producer_test.go#L164
+				// create message span with context
+				// ctx, _ := p.config.OTELTraceProvider.Tracer("watermill-kafka-producer").Start(context.Background(), "")
+				// propagators.Inject(ctx, otelsarama.NewProducerMessageCarrier(kafkaMsg))
+			}
+
+			partition, offset, err := p.producer.SendMessage(kafkaMsg)
+			if err != nil {
+				return errors.Wrapf(err, "cannot produce message %s", msg.UUID)
+			}
+
+			logFields["kafka_partition"] = partition
+			logFields["kafka_partition_offset"] = offset
+
+			p.logger.Trace("Message sent to Kafka", logFields)
+			return nil
+		}); err != nil {
+			return errors.Wrapf(err, "cannot intercept Kafka Producer")
 		}
-
-		partition, offset, err := p.producer.SendMessage(kafkaMsg)
-		if err != nil {
-			return errors.Wrapf(err, "cannot produce message %s", msg.UUID)
-		}
-
-		logFields["kafka_partition"] = partition
-		logFields["kafka_partition_offset"] = offset
-
-		p.logger.Trace("Message sent to Kafka", logFields)
 	}
 
 	return nil
