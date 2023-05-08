@@ -3,6 +3,9 @@ package kafka_test
 import (
 	"context"
 	"fmt"
+	"github.com/ThreeDotsLabs/watermill-kafka/v2/pkg/kafka/tracer"
+	"github.com/ThreeDotsLabs/watermill-kafka/v2/pkg/kafka/tracer/otel"
+	"github.com/ThreeDotsLabs/watermill-kafka/v2/pkg/kafka/tracer/oteltest"
 	"os"
 	"strings"
 	"testing"
@@ -27,7 +30,7 @@ func kafkaBrokers() []string {
 	return []string{"localhost:9091", "localhost:9092", "localhost:9093", "localhost:9094", "localhost:9095"}
 }
 
-func newPubSub(t *testing.T, marshaler kafka.MarshalerUnmarshaler, consumerGroup string) (*kafka.Publisher, *kafka.Subscriber) {
+func newPubSub(t *testing.T, marshaler kafka.MarshalerUnmarshaler, consumerGroup string, tracer tracer.Tracer) (*kafka.Publisher, *kafka.Subscriber) {
 	logger := watermill.NewStdLogger(true, true)
 
 	var err error
@@ -38,6 +41,7 @@ func newPubSub(t *testing.T, marshaler kafka.MarshalerUnmarshaler, consumerGroup
 		publisher, err = kafka.NewPublisher(kafka.PublisherConfig{
 			Brokers:   kafkaBrokers(),
 			Marshaler: marshaler,
+			Tracer:    tracer,
 		}, logger)
 		if err == nil || retriesLeft == 0 {
 			break
@@ -94,7 +98,7 @@ func generatePartitionKey(topic string, msg *message.Message) (string, error) {
 }
 
 func createPubSubWithConsumerGrup(t *testing.T, consumerGroup string) (message.Publisher, message.Subscriber) {
-	return newPubSub(t, kafka.DefaultMarshaler{}, consumerGroup)
+	return newPubSub(t, kafka.DefaultMarshaler{}, consumerGroup, nil)
 }
 
 func createPubSub(t *testing.T) (message.Publisher, message.Subscriber) {
@@ -102,11 +106,11 @@ func createPubSub(t *testing.T) (message.Publisher, message.Subscriber) {
 }
 
 func createPartitionedPubSub(t *testing.T) (message.Publisher, message.Subscriber) {
-	return newPubSub(t, kafka.NewWithPartitioningMarshaler(generatePartitionKey), "test")
+	return newPubSub(t, kafka.NewWithPartitioningMarshaler(generatePartitionKey), "test", nil)
 }
 
 func createNoGroupPubSub(t *testing.T) (message.Publisher, message.Subscriber) {
-	return newPubSub(t, kafka.DefaultMarshaler{}, "")
+	return newPubSub(t, kafka.DefaultMarshaler{}, "", nil)
 }
 
 func TestPublishSubscribe(t *testing.T) {
@@ -163,7 +167,7 @@ func TestNoGroupSubscriber(t *testing.T) {
 }
 
 func TestCtxValues(t *testing.T) {
-	pub, sub := newPubSub(t, kafka.DefaultMarshaler{}, "")
+	pub, sub := newPubSub(t, kafka.DefaultMarshaler{}, "", nil)
 	topicName := "topic_" + watermill.NewUUID()
 
 	var messagesToPublish []*message.Message
@@ -207,4 +211,43 @@ func TestCtxValues(t *testing.T) {
 	assert.EqualValues(t, expectedPartitionsOffsets, offsets)
 
 	require.NoError(t, pub.Close())
+}
+
+// see https://github.com/DataDog/dd-trace-go/blob/1abcec80856ed4015f240c69b46cf256ff250969/contrib/Shopify/sarama/sarama_test.go#L103-L126
+
+func TestOtelWrapSyncProducer(t *testing.T) {
+
+	// in memory exporter
+	exp := oteltest.NewInMemoryExporterWrapper()
+	tracer := otel.NewOTelTracer(nil, otel.WithExporterWrapperFactory(func(_ context.Context, config *otel.OTELConfig) (otel.ExporterWrapper, error) {
+		return exp, nil
+	}))
+
+	pub, sub := newPubSub(t, kafka.DefaultMarshaler{}, "", tracer)
+
+	topicName := "topic_" + watermill.NewUUID()
+
+	var messagesToPublish []*message.Message
+
+	for i := 0; i < 5; i++ {
+		id := watermill.NewUUID()
+		messagesToPublish = append(messagesToPublish, message.NewMessage(id, nil))
+	}
+
+	err := pub.Publish(topicName, messagesToPublish...)
+	require.NoError(t, err, "cannot publish message")
+
+	messages, err := sub.Subscribe(context.Background(), topicName)
+	require.NoError(t, err)
+
+	receivedMessages, all := subscriber.BulkReadWithDeduplication(messages, len(messagesToPublish), time.Second*10)
+	require.True(t, all)
+
+	spans := exp.GetSpans()
+
+	for _, msg := range receivedMessages {
+		// verify otelsarama headers
+		assert.NotEmpty(t, msg.Metadata.Get("traceparent"))
+	}
+
 }

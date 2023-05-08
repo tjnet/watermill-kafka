@@ -1,7 +1,9 @@
 package kafka
 
 import (
-	"go.opentelemetry.io/contrib/instrumentation/github.com/Shopify/sarama/otelsarama"
+	"context"
+	"github.com/ThreeDotsLabs/watermill-kafka/v2/pkg/kafka/tracer"
+	"github.com/ThreeDotsLabs/watermill-kafka/v2/pkg/kafka/tracer/noop"
 	"time"
 
 	"github.com/Shopify/sarama"
@@ -39,9 +41,7 @@ func NewPublisher(
 		return nil, errors.Wrap(err, "cannot create Kafka producer")
 	}
 
-	if config.OTELEnabled {
-		producer = otelsarama.WrapSyncProducer(config.OverwriteSaramaConfig, producer)
-	}
+	producer = config.Tracer.WrapSyncProducer(config.OverwriteSaramaConfig, producer)
 
 	return &Publisher{
 		config:   config,
@@ -60,13 +60,15 @@ type PublisherConfig struct {
 	// OverwriteSaramaConfig holds additional sarama settings.
 	OverwriteSaramaConfig *sarama.Config
 
-	// If true then each sent message will be wrapped with Opentelemetry tracing, provided by otelsarama.
-	OTELEnabled bool
+	Tracer tracer.Tracer
 }
 
 func (c *PublisherConfig) setDefaults() {
 	if c.OverwriteSaramaConfig == nil {
 		c.OverwriteSaramaConfig = DefaultSaramaSyncPublisherConfig()
+	}
+	if c.Tracer == nil {
+		c.Tracer = noop.NewNoOpTracer()
 	}
 }
 
@@ -106,24 +108,36 @@ func (p *Publisher) Publish(topic string, msgs ...*message.Message) error {
 	logFields["topic"] = topic
 
 	for _, msg := range msgs {
-		logFields["message_uuid"] = msg.UUID
-		p.logger.Trace("Sending message to Kafka", logFields)
-
-		kafkaMsg, err := p.config.Marshaler.Marshal(topic, msg)
-		if err != nil {
-			return errors.Wrapf(err, "cannot marshal message %s", msg.UUID)
-		}
-
-		partition, offset, err := p.producer.SendMessage(kafkaMsg)
-		if err != nil {
-			return errors.Wrapf(err, "cannot produce message %s", msg.UUID)
-		}
-
-		logFields["kafka_partition"] = partition
-		logFields["kafka_partition_offset"] = offset
-
-		p.logger.Trace("Message sent to Kafka", logFields)
+		p.sendMessage(logFields, msg, topic)
 	}
+
+	return nil
+}
+
+func (p *Publisher) sendMessage(logFields watermill.LogFields, msg *message.Message, topic string) error {
+	logFields["message_uuid"] = msg.UUID
+	p.logger.Trace("Sending message to Kafka", logFields)
+
+	kafkaMsg, err := p.config.Marshaler.Marshal(topic, msg)
+	if err != nil {
+		return errors.Wrapf(err, "cannot marshal message %s", msg.UUID)
+	}
+	cleanup, err := p.config.Tracer.TraceSendStart(context.Background(), kafkaMsg)
+
+	defer cleanup()
+	if err != nil {
+		return errors.Wrapf(err, "cannot start trace.")
+	}
+
+	partition, offset, err := p.producer.SendMessage(kafkaMsg)
+	if err != nil {
+		return errors.Wrapf(err, "cannot produce message %s", msg.UUID)
+	}
+
+	logFields["kafka_partition"] = partition
+	logFields["kafka_partition_offset"] = offset
+
+	p.logger.Trace("Message sent to Kafka", logFields)
 
 	return nil
 }

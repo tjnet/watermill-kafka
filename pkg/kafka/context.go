@@ -2,6 +2,7 @@ package kafka
 
 import (
 	"context"
+	"github.com/Shopify/sarama"
 	"time"
 )
 
@@ -12,6 +13,7 @@ const (
 	partitionContextKey
 	partitionOffsetContextKey
 	timestampContextKey
+	headersContextKey
 )
 
 func setPartitionToCtx(ctx context.Context, partition int32) context.Context {
@@ -42,4 +44,14 @@ func setMessageTimestampToCtx(ctx context.Context, timestamp time.Time) context.
 func MessageTimestampFromCtx(ctx context.Context) (time.Time, bool) {
 	timestamp, ok := ctx.Value(timestampContextKey).(time.Time)
 	return timestamp, ok
+}
+
+func setMessageHeaderToCtx(ctx context.Context, headers []*sarama.RecordHeader) context.Context {
+	return context.WithValue(ctx, headersContextKey, headers)
+}
+
+// MessageHeadersFromCtx returns Kafka internal headers of the consumed message
+func MessageHeadersFromCtx(ctx context.Context) ([]*sarama.RecordHeader, bool) {
+	headers, ok := ctx.Value(headersContextKey).([]*sarama.RecordHeader)
+	return headers, ok
 }
